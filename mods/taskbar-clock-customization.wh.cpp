@@ -1,6 +1,6 @@
 // ==WindhawkMod==
-// @id              taskbar-clock-customization
-// @name            Taskbar Clock Customization
+// @id              taskbar-clock-customization-fork
+// @name            Taskbar Clock Customization - Fork
 // @description     Custom date/time format, news feed, weather, performance metrics (upload/download speed, CPU, RAM, GPU, battery), media player info, custom fonts and colors, and more
 // @version         1.7
 // @author          m417z
@@ -9,7 +9,7 @@
 // @homepage        https://m417z.com/
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -ldxgi -lole32 -loleaut32 -lpdh -lpowrprof -lruntimeobject -lshlwapi -lversion -lwininet
+// @compilerOptions -ldxgi -lole32 -loleaut32 -lpdh -lpowrprof -lruntimeobject -lshlwapi -lshell32 -lversion -lwininet
 // ==/WindhawkMod==
 
 // Source code is published under The GNU General Public License v3.0.
@@ -105,7 +105,7 @@ patterns can be used:
   ellipsis, where `<n>` is the web contents number.
 * `%web<n>_full%` - the full web contents as configured in settings, where `<n>`
   is the web contents number.
-* `%newline%` or `%n%` - a newline.
+* `%newline%` - a newline.
 
 ## Text styles
 
@@ -120,6 +120,49 @@ styles, such as the font color and size.
 /*
 - ShowSeconds: true
   $name: Show seconds
+- ClockClickActions: true
+  $name: Enable clock click actions
+  $description: >-
+    Enable custom click actions for the clock. The tooltip is hidden when this
+    option is enabled.
+- ClockClickActionOptions:
+  - - Click: left
+      $name: Click
+      $options:
+      - left: Left click
+      - right: Right click
+    - Action: quickSettings
+      $name: Action
+      $options:
+      - quickSettings: Open Quick Settings
+      - notifications: Open Notifications
+      - startProcess: Open application, path or URL
+      - nothing: Do nothing
+    - Args: ""
+      $name: Arguments
+      $description: >-
+        Used for "Open application, path or URL". Use quotes for paths with spaces.
+        Prefix with "uac;" to request elevation.
+  - - Click: right
+      $name: Click
+      $options:
+      - left: Left click
+      - right: Right click
+    - Action: notifications
+      $name: Action
+      $options:
+      - quickSettings: Open Quick Settings
+      - notifications: Open Notifications
+      - startProcess: Open application, path or URL
+      - nothing: Do nothing
+    - Args: ""
+      $name: Arguments
+      $description: >-
+        Used for "Open application, path or URL". Use quotes for paths with spaces.
+        Prefix with "uac;" to request elevation.
+  $name: Clock click actions
+  $description: >-
+    Configure left and right click actions for the clock.
 - TimeFormat: >-
     hh':'mm':'ss tt
   $name: Time format
@@ -472,6 +515,7 @@ using namespace std::string_view_literals;
 #include <powrprof.h>
 #include <psapi.h>
 #include <shlwapi.h>
+#include <shellapi.h>
 #include <wininet.h>
 
 #undef GetCurrentTime
@@ -480,6 +524,7 @@ using namespace std::string_view_literals;
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Media.Control.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Input.h>
 #include <winrt/Windows.UI.Xaml.Interop.h>
 #include <winrt/Windows.UI.Xaml.Markup.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
@@ -567,6 +612,11 @@ struct TextStyleSettings {
 
 struct {
     bool showSeconds;
+    bool clockClickActions;
+    std::wstring clockClickLeftAction;
+    std::wstring clockClickLeftArgs;
+    std::wstring clockClickRightAction;
+    std::wstring clockClickRightArgs;
     StringSetting timeFormat;
     StringSetting dateFormat;
     StringSetting weekdayFormat;
@@ -690,10 +740,13 @@ struct ClockElementStyleData {
     DWORD styleIndex;
     std::optional<int64_t> dateVisibilityPropertyChangedToken;
     std::optional<int64_t> timeVisibilityPropertyChangedToken;
+    std::optional<winrt::event_token> clockTappedToken;
+    std::optional<winrt::event_token> clockRightTappedToken;
 };
 
 std::atomic<bool> g_clockElementStyleEnabled;
 std::atomic<DWORD> g_clockElementStyleIndex;
+std::atomic<bool> g_clockClickHandlerEnabled{true};
 std::vector<ClockElementStyleData> g_clockElementStyleData;
 
 using GetDpiForWindow_t = UINT(WINAPI*)(HWND hwnd);
@@ -2922,33 +2975,23 @@ PCWSTR GetBatteryTimeFormatted() {
 }
 
 PCWSTR GetPowerFormatted() {
-    return GetMetricFormatted(g_powerFormatted, [](PWSTR buffer,
-                                                   size_t bufferSize) {
-        SYSTEM_BATTERY_STATE batteryState{};
-        NTSTATUS status =
-            CallNtPowerInformation(SystemBatteryState, nullptr, 0,
-                                   &batteryState, sizeof(batteryState));
-        if (status == 0 && batteryState.MaxCapacity > 0) {
-            DWORD rate = batteryState.Rate;
+    return GetMetricFormatted(
+        g_powerFormatted, [](PWSTR buffer, size_t bufferSize) {
+            SYSTEM_BATTERY_STATE batteryState{};
 
-            // When some batteries charge the Rate is:
-            // 0x80000000 == -2147483648 (LONG) == 2147483648 (DWORD)
-            // https://github.com/jay/battstatus/blob/418d1872f6c4e560f6b46880d9577947f17cc414/battstatus.cpp#L265
-            if (rate == 0x80000000) {
-                rate = 0;
+            NTSTATUS status =
+                CallNtPowerInformation(SystemBatteryState, nullptr, 0,
+                                       &batteryState, sizeof(batteryState));
+
+            if (status == 0 && batteryState.MaxCapacity > 0 &&
+                batteryState.Rate != 0) {
+                long powerWatts = static_cast<long>(batteryState.Rate) / 1000;
+                swprintf_s(buffer, bufferSize, L"%+ldW", powerWatts);
+                return true;
             }
 
-            long powerMilliWatts = static_cast<long>(rate);
-
-            long powerWatts =
-                (powerMilliWatts + (powerMilliWatts >= 0 ? 500 : -500)) / 1000;
-
-            swprintf_s(buffer, bufferSize, L"%+ldW", powerWatts);
-            return true;
-        }
-
-        return false;
-    });
+            return false;
+        });
 }
 
 void RefreshMediaDataIfDirty() {
@@ -3042,7 +3085,6 @@ size_t ResolveFormatToken(
         {L"%media_status%"sv, GetMediaStatusFormatted},
         {L"%media_info%"sv, GetMediaInfoFormatted},
         {L"%newline%"sv, []() { return L"\n"; }},
-        {L"%n%"sv, []() { return L"\n"; }},
     };
 
     for (const auto& formatToken : formatTokens) {
@@ -3302,13 +3344,6 @@ void WINAPI ClockSystemTrayIconDataModel2_RefreshIcon_Hook(LPVOID pThis,
 void UpdateToolTipString(LPVOID tooltipPtrPtr) {
     auto separator = L"\r\n\r\n"sv;
 
-    WCHAR extraLine[256];
-    size_t extraLength = FormatLine(extraLine, ARRAYSIZE(extraLine),
-                                    g_settings.tooltipLine.get());
-    if (extraLength == 0) {
-        return;
-    }
-
     // Reference:
     // https://github.com/microsoft/cppwinrt/blob/0a6cb062e2151cf6c8f357aa8ef735e359f8a98c/strings/base_string.h
     struct hstring_header {
@@ -3326,6 +3361,29 @@ void UpdateToolTipString(LPVOID tooltipPtrPtr) {
 
     shared_hstring_header* tooltipHeader =
         *(shared_hstring_header**)tooltipPtrPtr;
+
+    if (g_settings.clockClickActions) {
+        uint64_t bytesRequired = sizeof(shared_hstring_header);
+        shared_hstring_header* tooltipHeaderNew =
+            (shared_hstring_header*)HeapReAlloc(
+                GetProcessHeap(), 0, tooltipHeader, bytesRequired);
+        if (!tooltipHeaderNew) {
+            return;
+        }
+
+        tooltipHeaderNew->ptr = tooltipHeaderNew->buffer;
+        tooltipHeaderNew->length = 0;
+        tooltipHeaderNew->buffer[0] = L'\0';
+        *(shared_hstring_header**)tooltipPtrPtr = tooltipHeaderNew;
+        return;
+    }
+
+    WCHAR extraLine[256];
+    size_t extraLength = FormatLine(extraLine, ARRAYSIZE(extraLine),
+                                    g_settings.tooltipLine.get());
+    if (extraLength == 0) {
+        return;
+    }
 
     uint64_t bytesRequired = sizeof(shared_hstring_header);
     if (g_settings.tooltipLineMode == TooltipLineMode::replace) {
@@ -3470,6 +3528,290 @@ FrameworkElement FindChildByName(FrameworkElement element,
     }
 
     return nullptr;
+}
+
+void OpenQuickSettings() {
+    INPUT inputs[4]{};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_LWIN;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = 'A';
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = 'A';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_LWIN;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT));
+}
+
+void OpenNotificationCenter() {
+    INPUT inputs[4]{};
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_LWIN;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = g_winVersion >= WinVersion::Win11 ? 'N' : 'A';
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = g_winVersion >= WinVersion::Win11 ? 'N' : 'A';
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_LWIN;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+
+    SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT));
+}
+
+enum class ClockClickAction {
+    none,
+    quickSettings,
+    notifications,
+    startProcess,
+};
+
+ClockClickAction ParseClockClickAction(PCWSTR action) {
+    if (!action || !*action) {
+        return ClockClickAction::none;
+    }
+
+    if (_wcsicmp(action, L"quickSettings") == 0) {
+        return ClockClickAction::quickSettings;
+    }
+
+    if (_wcsicmp(action, L"notifications") == 0) {
+        return ClockClickAction::notifications;
+    }
+
+    if (_wcsicmp(action, L"startProcess") == 0) {
+        return ClockClickAction::startProcess;
+    }
+
+    return ClockClickAction::none;
+}
+
+struct CommandLineParts {
+    std::wstring executable;
+    std::wstring parameters;
+};
+
+CommandLineParts ParseCommandLine(std::wstring_view command) {
+    CommandLineParts parts;
+    std::wstring_view trimmed = TrimStringView(command);
+    if (trimmed.empty()) {
+        return parts;
+    }
+
+    if (trimmed.front() == L'\"') {
+        size_t endQuote = trimmed.find(L'\"', 1);
+        if (endQuote != std::wstring_view::npos) {
+            parts.executable = std::wstring(trimmed.substr(1, endQuote - 1));
+            parts.parameters =
+                std::wstring(TrimStringView(trimmed.substr(endQuote + 1)));
+        } else {
+            parts.executable = std::wstring(trimmed.substr(1));
+        }
+        return parts;
+    }
+
+    size_t space = trimmed.find_first_of(L" \t");
+    if (space == std::wstring_view::npos) {
+        parts.executable = std::wstring(trimmed);
+        return parts;
+    }
+
+    parts.executable = std::wstring(trimmed.substr(0, space));
+    parts.parameters = std::wstring(TrimStringView(trimmed.substr(space + 1)));
+    return parts;
+}
+
+void StartProcess(std::wstring command) {
+    command = std::wstring(TrimStringView(command));
+    if (command.empty()) {
+        return;
+    }
+
+    PCWSTR verb = L"open";
+    if (command.size() >= 4 && _wcsnicmp(command.c_str(), L"uac;", 4) == 0) {
+        verb = L"runas";
+        command = std::wstring(
+            TrimStringView(std::wstring_view(command).substr(4)));
+    }
+
+    if (command.empty()) {
+        return;
+    }
+
+    CommandLineParts parts = ParseCommandLine(command);
+    if (parts.executable.empty()) {
+        return;
+    }
+
+    SHELLEXECUTEINFO sei = {sizeof(sei)};
+    sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb = verb;
+    sei.lpFile = parts.executable.c_str();
+    sei.lpParameters =
+        parts.parameters.empty() ? nullptr : parts.parameters.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+
+    if (!ShellExecuteEx(&sei)) {
+        Wh_Log(L"Failed to start process: %lu", GetLastError());
+    }
+}
+
+void ExecuteClockClickAction(ClockClickAction action, PCWSTR args) {
+    switch (action) {
+        case ClockClickAction::quickSettings:
+            OpenQuickSettings();
+            break;
+        case ClockClickAction::notifications:
+            OpenNotificationCenter();
+            break;
+        case ClockClickAction::startProcess:
+            StartProcess(args ? args : L"");
+            break;
+        case ClockClickAction::none:
+        default:
+            break;
+    }
+}
+
+void LoadClockClickActionOptions() {
+    g_settings.clockClickLeftAction.clear();
+    g_settings.clockClickLeftArgs.clear();
+    g_settings.clockClickRightAction.clear();
+    g_settings.clockClickRightArgs.clear();
+
+    for (int i = 0;; i++) {
+        StringSetting click =
+            StringSetting::make(L"ClockClickActionOptions[%d].Click", i);
+        if (*click == '\0') {
+            break;
+        }
+
+        StringSetting action =
+            StringSetting::make(L"ClockClickActionOptions[%d].Action", i);
+        StringSetting args =
+            StringSetting::make(L"ClockClickActionOptions[%d].Args", i);
+
+        if (_wcsicmp(click, L"left") == 0) {
+            g_settings.clockClickLeftAction = action.get();
+            g_settings.clockClickLeftArgs = args.get();
+        } else if (_wcsicmp(click, L"right") == 0) {
+            g_settings.clockClickRightAction = action.get();
+            g_settings.clockClickRightArgs = args.get();
+        }
+    }
+
+    if (g_settings.clockClickLeftAction.empty()) {
+        StringSetting legacyAction =
+            StringSetting::make(L"ClockClickLeftAction");
+        if (*legacyAction != '\0') {
+            g_settings.clockClickLeftAction = legacyAction.get();
+        }
+        StringSetting legacyArgs = StringSetting::make(L"ClockClickLeftArgs");
+        if (*legacyArgs != '\0') {
+            g_settings.clockClickLeftArgs = legacyArgs.get();
+        }
+    }
+
+    if (g_settings.clockClickRightAction.empty()) {
+        StringSetting legacyAction =
+            StringSetting::make(L"ClockClickRightAction");
+        if (*legacyAction != '\0') {
+            g_settings.clockClickRightAction = legacyAction.get();
+        }
+        StringSetting legacyArgs = StringSetting::make(L"ClockClickRightArgs");
+        if (*legacyArgs != '\0') {
+            g_settings.clockClickRightArgs = legacyArgs.get();
+        }
+    }
+
+    if (g_settings.clockClickLeftAction.empty()) {
+        g_settings.clockClickLeftAction = L"quickSettings";
+    }
+    if (g_settings.clockClickRightAction.empty()) {
+        g_settings.clockClickRightAction = L"notifications";
+    }
+}
+
+void UpdateClockClickHandler(FrameworkElement dateTimeIconContentElement,
+                             ClockElementStyleData& clockElementStyleData) {
+    if (!g_clockClickHandlerEnabled) {
+        if (clockElementStyleData.clockTappedToken.has_value()) {
+            dateTimeIconContentElement.Tapped(
+                clockElementStyleData.clockTappedToken.value());
+            clockElementStyleData.clockTappedToken.reset();
+        }
+        if (clockElementStyleData.clockRightTappedToken.has_value()) {
+            dateTimeIconContentElement.RightTapped(
+                clockElementStyleData.clockRightTappedToken.value());
+            clockElementStyleData.clockRightTappedToken.reset();
+        }
+        return;
+    }
+
+    if (!clockElementStyleData.clockTappedToken.has_value()) {
+        clockElementStyleData.clockTappedToken =
+            dateTimeIconContentElement.Tapped(
+                [](winrt::Windows::Foundation::IInspectable const&,
+                   winrt::Windows::UI::Xaml::Input::TappedRoutedEventArgs const& args) {
+                    ClockClickAction action = ParseClockClickAction(
+                        g_settings.clockClickLeftAction.c_str());
+                    if (action == ClockClickAction::none) {
+                        return;
+                    }
+
+                    args.Handled(true);
+                    ExecuteClockClickAction(
+                        action, g_settings.clockClickLeftArgs.c_str());
+                });
+    }
+
+    if (!clockElementStyleData.clockRightTappedToken.has_value()) {
+        clockElementStyleData.clockRightTappedToken =
+            dateTimeIconContentElement.RightTapped(
+                [](winrt::Windows::Foundation::IInspectable const&,
+                   winrt::Windows::UI::Xaml::Input::RightTappedRoutedEventArgs const& args) {
+                    ClockClickAction action = ParseClockClickAction(
+                        g_settings.clockClickRightAction.c_str());
+                    if (action == ClockClickAction::none) {
+                        return;
+                    }
+
+                    args.Handled(true);
+                    ExecuteClockClickAction(
+                        action, g_settings.clockClickRightArgs.c_str());
+                });
+    }
+}
+
+void ClearClockClickHandlers() {
+    for (auto& data : g_clockElementStyleData) {
+        auto element = data.dateTimeIconContentElement.get();
+        if (element && data.clockTappedToken.has_value()) {
+            element.Tapped(data.clockTappedToken.value());
+        }
+        if (element && data.clockRightTappedToken.has_value()) {
+            element.RightTapped(data.clockRightTappedToken.value());
+        }
+        data.clockTappedToken.reset();
+        data.clockRightTappedToken.reset();
+    }
+}
+
+void RefreshClockClickHandlers() {
+    for (auto it = g_clockElementStyleData.begin();
+         it != g_clockElementStyleData.end();) {
+        auto element = it->dateTimeIconContentElement.get();
+        if (!element) {
+            it = g_clockElementStyleData.erase(it);
+            continue;
+        }
+
+        UpdateClockClickHandler(element, *it);
+        ++it;
+    }
 }
 
 void ApplyStackPanelStyles(Controls::StackPanel stackPanel,
@@ -3635,15 +3977,23 @@ void ApplyDateTimeIconContentStyles(
         ++it;
     }
 
+    if (!clockElementStyleData) {
+        g_clockElementStyleData.push_back(ClockElementStyleData{
+            .dateTimeIconContentElement = dateTimeIconContentElement,
+        });
+        clockElementStyleData = &g_clockElementStyleData.back();
+    }
+
+    UpdateClockClickHandler(dateTimeIconContentElement, *clockElementStyleData);
+
     bool clockElementStyleEnabled = g_clockElementStyleEnabled;
     DWORD clockElementStyleIndex = g_clockElementStyleIndex;
 
-    if (!clockElementStyleData && !clockElementStyleEnabled) {
+    if (!clockElementStyleEnabled) {
         return;
     }
 
-    if (clockElementStyleData &&
-        clockElementStyleData->styleIndex == clockElementStyleIndex) {
+    if (clockElementStyleData->styleIndex == clockElementStyleIndex) {
         return;
     }
 
@@ -3679,13 +4029,6 @@ void ApplyDateTimeIconContentStyles(
 
     if (!dateInnerTextBlock || !timeInnerTextBlock) {
         return;
-    }
-
-    if (!clockElementStyleData) {
-        g_clockElementStyleData.push_back(ClockElementStyleData{
-            .dateTimeIconContentElement = dateTimeIconContentElement,
-        });
-        clockElementStyleData = &g_clockElementStyleData.back();
     }
 
     int maxWidth = clockElementStyleEnabled ? g_settings.maxWidth : 0;
@@ -4054,7 +4397,9 @@ HRESULT WINAPI ClockButton_v_GetTooltipText_Hook(LPVOID pThis,
                                                         param3, param4);
 
     if (g_getTooltipTextBuffer) {
-        if (g_settings.tooltipLineMode == TooltipLineMode::replace) {
+        if (g_settings.clockClickActions) {
+            g_getTooltipTextBuffer[0] = L'\0';
+        } else if (g_settings.tooltipLineMode == TooltipLineMode::replace) {
             FormatLine(g_getTooltipTextBuffer, g_getTooltipTextBufferSize,
                        g_settings.tooltipLine.get());
         } else {
@@ -4572,6 +4917,9 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
 
 void LoadSettings() {
     g_settings.showSeconds = Wh_GetIntSetting(L"ShowSeconds");
+    g_settings.clockClickActions = Wh_GetIntSetting(L"ClockClickActions");
+    LoadClockClickActionOptions();
+    g_clockClickHandlerEnabled = g_settings.clockClickActions;
     g_settings.timeFormat = StringSetting::make(L"TimeFormat");
     g_settings.dateFormat = StringSetting::make(L"DateFormat");
     g_settings.weekdayFormat = StringSetting::make(L"WeekdayFormat");
@@ -5110,6 +5458,8 @@ void Wh_ModAfterInit() {
 
 void Wh_ModBeforeUninit() {
     Wh_Log(L">");
+    g_clockClickHandlerEnabled = false;
+    ClearClockClickHandlers();
 
     if (g_winVersion >= WinVersion::Win11 &&
         g_clockElementStyleEnabled.exchange(false)) {
@@ -5154,8 +5504,15 @@ BOOL Wh_ModSettingsChanged(BOOL* bReload) {
     MediaSessionUninit();
 
     bool prevOldTaskbarOnWin11 = g_settings.oldTaskbarOnWin11;
+    bool prevClockClickActions = g_settings.clockClickActions;
 
     LoadSettings();
+
+    if (prevClockClickActions && !g_settings.clockClickActions) {
+        ClearClockClickHandlers();
+    } else if (!prevClockClickActions && g_settings.clockClickActions) {
+        RefreshClockClickHandlers();
+    }
 
     *bReload = g_settings.oldTaskbarOnWin11 != prevOldTaskbarOnWin11;
     if (*bReload) {
